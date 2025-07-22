@@ -52,3 +52,4 @@ for post in post.json()['data']['children']:
     print(post['data']['url'])
     print()
     print("--------------------------------------------------")
+
