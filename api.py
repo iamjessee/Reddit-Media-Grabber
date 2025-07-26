@@ -38,7 +38,6 @@ def process_gallery(post):
         download_image(url, filename)
 
 def main():
-    # --- Load secrets ---
     secrets = {}
     with open("secrets.txt") as file:
         for line in file:
@@ -50,7 +49,6 @@ def main():
     CLIENT_ID = secrets["CLIENT_ID"]
     CLIENT_SECRET = secrets["CLIENT_SECRET"]
 
-    # --- Auth ---
     auth = requests.auth.HTTPBasicAuth(CLIENT_ID, CLIENT_SECRET)
     data = {
         "grant_type": "password",
@@ -65,12 +63,12 @@ def main():
     TOKEN = res.json()['access_token']
     headers["Authorization"] = f"bearer {TOKEN}"
 
-    # --- Get post data ---
+    # Get post data
     post_id = input("Enter Reddit post ID (e.g. 1m990a6): ").strip()
     res = requests.get(f"https://oauth.reddit.com/comments/{post_id}", headers=headers)
     post = res.json()[0]['data']['children'][0]['data']
 
-    # --- Process the post ---
+    # Process the post
     if 'gallery_data' in post and 'media_metadata' in post:
         print("Gallery detected.")
         process_gallery(post)
