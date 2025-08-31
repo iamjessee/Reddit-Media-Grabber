@@ -1,14 +1,15 @@
+from __future__ import annotations
+
 import os
-import platform
 import re
 from pathlib import Path
 from typing import Optional, Tuple
 from urllib.parse import urlparse
 
+# Basic UA
+USER_AGENT = "RedditMediaGrabber/1.1 (by u/yourusername)"
 
-# Keep your UA clear and consistent
-USER_AGENT = "RedditMediaGrabber/1.0 (by u/yourusername)"
-
+# Content-Type -> extension map
 EXT_MAP = {
     "video/mp4": ".mp4",
     "image/gif": ".gif",
@@ -17,86 +18,116 @@ EXT_MAP = {
     "image/webp": ".webp",
 }
 
-def sniff_ext_from_headers(content_type: Optional[str], url: str) -> str:
-    if content_type:
-        ct = content_type.split(";", 1)[0].lower().strip()
-        if ct in EXT_MAP:
-            return EXT_MAP[ct]
-    # fallback by URL path
-    path = urlparse(url).path.lower()
-    for ext in (".mp4", ".gif", ".jpg", ".jpeg", ".png", ".webp"):
-        if path.endswith(ext):
-            return ext if ext != ".jpeg" else ".jpg"
-    return ".bin"
+IMAGE_HOSTS = ("i.redd.it", "preview.redd.it", "external-preview.redd.it", "i.imgur.com")
 
-def sanitize_url(u: str) -> str:
-    return u.replace("&amp;", "&")
 
 def getenv_required(name: str) -> Optional[str]:
     val = os.getenv(name)
-    return val if val and val.strip() else None
-
-import shutil
-import subprocess
-import tempfile
-from pathlib import Path
-def ffmpeg_convert_mp4_to_gif(src_mp4: Path, dst_gif: Path):
-    if not shutil.which("ffmpeg"):
-        raise RuntimeError("ffmpeg not found. Install ffmpeg first.")
-    # 2-pass palette for decent quality/size
-    filt = (
-        "fps=15,scale=640:-1:flags=lanczos,split[s0][s1];"
-        "[s0]palettegen=stats_mode=diff[p];[s1][p]paletteuse=dither=bayer:bayer_scale=5"
-    )
-    subprocess.run(
-        ["ffmpeg", "-y", "-i", str(src_mp4), "-vf", filt, "-loop", "0", str(dst_gif)],
-        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-    )
-
-# Recognize common Reddit post URL shapes, including user profile comment permalinks
-ID_PATTERNS = [
-re.compile(r"https?://(?:www\.)?redd\.it/([a-z0-9]{5,8})(?:[/?#]|$)", re.I),
-re.compile(r"https?://(?:www\.)?reddit\.com/r/[^/]+/comments/([a-z0-9]{5,8})(?:[/?#]|$)", re.I),
-re.compile(r"https?://(?:www\.)?reddit\.com/(?:r/[^/]+/)?comments/([a-z0-9]{5,8})(?:[/?#]|$)", re.I),
-re.compile(r"https?://(?:www\.)?reddit\.com/(?:u|user)/[^/]+/comments/([a-z0-9]{5,8})(?:[/?#]|$)", re.I),
-]
-
-POST_ID_RE = re.compile(r"^[a-z0-9]{5,8}$", re.I)
-
-def is_valid_post_id(s: str) -> bool:
-    """True if string is exactly a 5–8 char base36 Reddit post ID."""
-    return bool(POST_ID_RE.fullmatch(s))
+    return val.strip() if val and val.strip() else None
 
 
 def get_download_dir() -> Path:
-    """Return the output directory. If OUTPUT_DIR is set, use it; otherwise ~/Downloads."""
     env = os.getenv("OUTPUT_DIR")
     if env:
         p = Path(env).expanduser().resolve()
-        p.mkdir(parents=True, exist_ok=True)
-        return p
+    else:
+        p = Path.home() / "Downloads"
+    p.mkdir(parents=True, exist_ok=True)
+    return p
 
-    # Default to ~/Downloads on macOS, Windows, Linux
-    home = Path.home()
-    dl = home / "Downloads"
-    dl.mkdir(parents=True, exist_ok=True)
-    return dl
+
+# --- ID parsing ---
+ID_PATTERNS = [
+    re.compile(r"https?://(?:www\.)?redd\.it/([a-z0-9]{5,8})", re.I),
+    re.compile(r"https?://(?:www\.)?reddit\.com/r/[^/]+/comments/([a-z0-9]{5,8})", re.I),
+    re.compile(r"https?://(?:www\.)?reddit\.com/(?:u|user)/[^/]+/comments/([a-z0-9]{5,8})", re.I),
+]
+POST_ID_RE = re.compile(r"^[a-z0-9]{5,8}$", re.I)
+
+
+def is_valid_post_id(s: str) -> bool:
+    return bool(POST_ID_RE.fullmatch(s))
 
 
 def parse_post_id(url_or_id: str) -> Tuple[str, Optional[str]]:
-    """
-    Given a Reddit URL or bare ID, return (post_id_or_input, original_url_or_None).
-
-    - If a recognized Reddit URL contains a valid post ID, returns (id, full_url)
-    - If input is a URL but we couldn't extract an ID, returns (input, full_url)
-    - Otherwise assume it's a bare ID and return (input, None)
-    """
     s = (url_or_id or "").strip()
     for pat in ID_PATTERNS:
         m = pat.search(s)
         if m:
             return m.group(1), s
-
     if s.lower().startswith(("http://", "https://")):
         return s, s
     return s, None
+
+
+def sanitize_url(u: str | None) -> str | None:
+    return u.replace("&amp;", "&") if isinstance(u, str) else u
+
+
+def _ext_from_content_disposition(dispo: Optional[str]) -> Optional[str]:
+    if not dispo:
+        return None
+    # crude filename= extractor
+    m = re.search(r"filename\*=UTF-8''([^;\r\n]+)|filename=\"?([^;\r\n\"]+)\"?", dispo, re.I)
+    filename = m.group(1) if m and m.group(1) else (m.group(2) if m else None)
+    if not filename:
+        return None
+    filename = filename.split("?")[0]
+    for ext in (".mp4", ".gif", ".jpg", ".jpeg", ".png", ".webp"):
+        if filename.lower().endswith(ext):
+            return ".jpg" if ext == ".jpeg" else ext
+    return None
+
+
+def sniff_ext_from_headers(content_type: Optional[str], url: str, content_disposition: Optional[str] = None) -> str:
+    # 1) Try Content-Disposition filename
+    if ext := _ext_from_content_disposition(content_disposition):
+        return ext
+
+    # 2) Try Content-Type map
+    if content_type:
+        ct = content_type.split(";", 1)[0].lower().strip()
+        if ct in EXT_MAP:
+            return EXT_MAP[ct]
+
+    # 3) Heuristic by host if octet-stream or unknown
+    host = urlparse(url).netloc.lower()
+    if host.endswith("v.redd.it"):
+        return ".mp4"
+    if host.endswith(IMAGE_HOSTS):
+        return ".jpg"
+
+    # 4) Fallback by URL path
+    path = urlparse(url).path.lower()
+    for ext in (".mp4", ".gif", ".jpg", ".jpeg", ".png", ".webp"):
+        if path.endswith(ext):
+            return ".jpg" if ext == ".jpeg" else ext
+
+    # 5) Last resort
+    return ".bin"
+
+
+# Optional yt-dlp fallback
+try:
+    from yt_dlp import YoutubeDL  # type: ignore
+except Exception:
+    YoutubeDL = None
+
+
+def yt_dlp_download(url: str, outdir: Path) -> bool:
+    if YoutubeDL is None:
+        return False
+    tmpl = str(outdir / "%(title).80s_%(id)s.%(ext)s")
+    ydl_opts = {
+        "outtmpl": tmpl,
+        "noplaylist": True,
+        "quiet": False,
+        "merge_output_format": "mp4",
+        "cachedir": False,
+    }
+    try:
+        with YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            return bool(info)
+    except Exception:
+        return False

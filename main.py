@@ -1,26 +1,68 @@
-import os
-import sys
+from __future__ import annotations
+
 import json
-import time
+import re
+import sys
 from pathlib import Path
-from typing import Optional
-import subprocess
-import shutil
-import tempfile
+from typing import Any, Dict, Optional
 from urllib.parse import urlparse
 
 import requests
-from yt_dlp import YoutubeDL
-
 from dotenv import load_dotenv
+
+from utils import (
+    USER_AGENT,
+    get_download_dir,
+    parse_post_id,
+    is_valid_post_id,
+    getenv_required,
+    sanitize_url,
+    sniff_ext_from_headers,
+    yt_dlp_download,
+)
+
 load_dotenv()
-
-from utils import get_download_dir, parse_post_id, is_valid_post_id, USER_AGENT, sanitize_url, EXT_MAP, sniff_ext_from_headers, getenv_required, ffmpeg_convert_mp4_to_gif
-
 
 API_BASE = "https://oauth.reddit.com"
 PUBLIC_BASE = "https://www.reddit.com"
 
+IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".gif", ".webp")
+IMAGE_HOSTS = ("i.redd.it", "preview.redd.it", "external-preview.redd.it", "i.imgur.com")
+
+EXTERNAL_EXCLUDE_DOMAINS = {
+    "reddit.com",
+    "redd.it",
+    "v.redd.it",
+    "i.redd.it",
+    "preview.redd.it",
+    "external-preview.redd.it",
+}
+
+
+# ------------------------------ Utility ------------------------------------- #
+
+def save_json(obj: Dict[str, Any], outdir: Path, name: str) -> Path:
+    outdir.mkdir(parents=True, exist_ok=True)
+    outpath = outdir / f"{name}.json"
+    with open(outpath, "w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=2, ensure_ascii=False)
+    return outpath
+
+
+def is_imageish_url(u: Optional[str]) -> bool:
+    if not u:
+        return False
+    p = urlparse(u)
+    if any(p.path.lower().endswith(ext) for ext in IMAGE_EXTS):
+        return True
+    return any(p.netloc.lower().endswith(h) for h in IMAGE_HOSTS)
+
+
+def is_external_domain(host: str) -> bool:
+    return not any(host.endswith(d) for d in EXTERNAL_EXCLUDE_DOMAINS)
+
+
+# ------------------------------ Reddit API ---------------------------------- #
 
 def get_token() -> Optional[str]:
     """Return OAuth token if credentials provided, else None."""
@@ -39,180 +81,250 @@ def get_token() -> Optional[str]:
     return r.json().get("access_token")
 
 
-def get_post_json(post_id: str, token: Optional[str]) -> dict:
+def fetch_post(post_id: str, token: Optional[str]) -> Dict[str, Any]:
+    """Fetch a single post object from Reddit. Works with or without OAuth token."""
     headers = {"User-Agent": USER_AGENT}
+    cookies = {"over18": "1"}
     if token:
         headers["Authorization"] = f"bearer {token}"
         url = f"{API_BASE}/comments/{post_id}?raw_json=1"
     else:
         url = f"{PUBLIC_BASE}/comments/{post_id}.json?raw_json=1"
 
-    r = requests.get(url, headers=headers, timeout=20)
+    r = requests.get(url, headers=headers, cookies=cookies, timeout=20)
     r.raise_for_status()
     data = r.json()
     if isinstance(data, list) and data:
         return data[0]["data"]["children"][0]["data"]
-    return data
+    return data if isinstance(data, dict) else {}
 
 
-def is_gallery(post: dict) -> bool:
-    return "gallery_data" in post and "media_metadata" in post
+def canonical_post(post: Dict[str, Any]) -> Dict[str, Any]:
+    """For crossposts, prefer the original parent's object for accurate media fields."""
+    cpl = post.get("crosspost_parent_list")
+    if isinstance(cpl, list) and cpl:
+        return cpl[0]
+    return post
 
 
+# ------------------------------ Detection ----------------------------------- #
+
+def detect_media_type(post: Dict[str, Any]) -> str:
+    """Return one of: 'video', 'gallery', 'direct_image', 'preview_image', 'external', 'unknown'."""
+    # Video has highest priority
+    if (
+        post.get("is_video")
+        or post.get("post_hint") == "hosted:video"
+        or (post.get("media") or {}).get("reddit_video")
+        or (post.get("secure_media") or {}).get("reddit_video")
+        or (post.get("domain") or "").lower() == "v.redd.it"
+    ):
+        return "video"
+
+    # Gallery
+    if "gallery_data" in post and "media_metadata" in post:
+        return "gallery"
+
+    # rich embed (YouTube, TikTok, etc.) -> treat as external for yt-dlp
+    if post.get("post_hint") == "rich:video":
+        return "external"
+
+    # Direct image-ish link (i.redd.it / preview.redd.it / imgur direct)
+    uod = sanitize_url(post.get("url_overridden_by_dest"))
+    if is_imageish_url(uod):
+        return "direct_image"
+
+    # Preview image (present on many posts incl. video; use only as fallback)
+    if (post.get("preview") or {}).get("images"):
+        return "preview_image"
+
+    # External link fallback
+    if uod:
+        return "external"
+
+    return "unknown"
 
 
-def download_file(url: str, outpath_stem: Path):
+def extract_external_media_url(post: Dict[str, Any]) -> Optional[str]:
+    """Return best external URL to give yt-dlp, or None."""
+    # 1) Prefer explicit link if it's external and not a direct image
+    u = sanitize_url(post.get("url_overridden_by_dest") or post.get("url"))
+    if u:
+        host = urlparse(u).netloc.lower()
+        if is_external_domain(host) and not is_imageish_url(u):
+            return u
+
+    # 2) Try media/secure_media oembed url or iframe src
+    for key in ("media", "secure_media"):
+        m = post.get(key) or {}
+        oe = m.get("oembed")
+        if isinstance(oe, dict):
+            if oe.get("url"):
+                return sanitize_url(oe["url"])
+            if oe.get("html"):
+                msrc = re.search(r'src="([^"]+)"', oe["html"])  # basic iframe src extractor
+                if msrc:
+                    return sanitize_url(msrc.group(1))
+    return None
+
+
+# ------------------------------ Download core -------------------------------- #
+
+def download_file(url: str, outpath_stem: Path) -> None:
     outpath_stem.parent.mkdir(parents=True, exist_ok=True)
     headers = {"User-Agent": USER_AGENT, "Referer": "https://www.reddit.com/"}
     with requests.get(url, stream=True, timeout=60, headers=headers) as r:
         r.raise_for_status()
-        ext = sniff_ext_from_headers(r.headers.get("Content-Type"), url)
+        ct = r.headers.get("Content-Type")
+        cd = r.headers.get("Content-Disposition")
+        ext = sniff_ext_from_headers(ct, url, cd)
         outpath = outpath_stem.with_suffix(ext)
         with open(outpath, "wb") as f:
             for chunk in r.iter_content(chunk_size=1 << 15):
                 if chunk:
                     f.write(chunk)
-        print(f"Saved {outpath.name} ({r.headers.get('Content-Type')})")
+        print(f"Saved {outpath} (Content-Type: {ct})")
 
 
-def download_gallery(post: dict, outdir: Path):
-    media_ids = [item["media_id"] for item in post["gallery_data"]["items"]]
+# ------------------------------ Handlers ------------------------------------ #
+
+def handle_video(post: Dict[str, Any], outdir: Path) -> Dict[str, Any]:
+    rv = (post.get("media") or {}).get("reddit_video") or (post.get("secure_media") or {}).get("reddit_video") or {}
+    info = {
+        "type": "video",
+        "fallback_url": sanitize_url(rv.get("fallback_url")),
+        "hls_url": sanitize_url(rv.get("hls_url")),
+        "dash_url": sanitize_url(rv.get("dash_url")),
+        "has_audio": rv.get("has_audio"),
+    }
+    print("Branch: VIDEO")
+    if info["fallback_url"]:
+        download_file(info["fallback_url"], outdir / post.get("id", "post"))
+    else:
+        print("Video detected but no fallback_url available")
+    return info
+
+
+def handle_gallery(post: Dict[str, Any], outdir: Path) -> Dict[str, Any]:
+    print("Branch: GALLERY")
     meta = post["media_metadata"]
+    items = []
     base = post.get("id", "post")
 
-    for idx, mid in enumerate(media_ids, start=1):
-        m = meta[mid]
-        kind = m.get("e")  # Image or AnimatedImage
+    for idx, it in enumerate(post["gallery_data"].get("items", []), 1):
+        mid = it.get("media_id")
+        m = meta.get(mid, {}) if isinstance(meta, dict) else {}
+        kind = m.get("e")
+        s = m.get("s") or {}
         base_name = f"{base}_{idx:02d}"
 
         if kind == "Image":
-            url = sanitize_url(m["s"]["u"])
-            download_file(url, outdir / f"{base_name}.jpg")
-            print(f"Saved {base_name}.jpg")
-            continue
+            url = sanitize_url(s.get("u"))
+            if url:
+                items.append({"type": "image", "url": url})
+                download_file(url, outdir / base_name)
 
-        if kind == "AnimatedImage":
-            gif_url = sanitize_url(m.get("s", {}).get("gif") or "")
-            mp4_url = sanitize_url(m.get("s", {}).get("mp4") or "")
+        elif kind == "AnimatedImage":
+            # Prefer native GIF if present; otherwise grab the MP4 (no conversion)
+            gif = sanitize_url(s.get("gif"))
+            mp4 = sanitize_url(s.get("mp4"))
+            if gif:
+                items.append({"type": "gif", "url": gif})
+                download_file(gif, outdir / base_name)
+            elif mp4:
+                items.append({"type": "animated_mp4", "url": mp4})
+                download_file(mp4, outdir / base_name)
 
-            if gif_url:
-                download_file(gif_url, outdir / f"{base_name}.gif")
-                print(f"Saved {base_name}.gif")
-                continue
-
-            if mp4_url:
-                # Convert MP4 → GIF so Preview opens it as a true GIF
-                with tempfile.TemporaryDirectory() as td:
-                    tmp_mp4 = Path(td) / f"{base_name}.mp4"
-                    download_file(mp4_url, tmp_mp4)
-                    out_gif = outdir / f"{base_name}.gif"
-                    ffmpeg_convert_mp4_to_gif(tmp_mp4, out_gif)
-                    print(f"Saved {out_gif.name} (converted from mp4)")
-                continue
-
-        print(f"Skipping unsupported item {mid}: kind={kind}")
+    return {"type": "gallery", "items": items}
 
 
-def ytdlp_download(url: str, outdir: Path) -> bool:
-    tmpl = str(outdir / "%(title).80s_%(id)s.%(ext)s")
-    ydl_opts = {
-        "outtmpl": tmpl,
-        "noplaylist": True,
-        "quiet": False,
-        "merge_output_format": "mp4",
-        "cachedir": False,
-        # Be explicit about cookie handling off by default
-        "cookiesfrombrowser": None,
-    }
-
-    try:
-        with YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            # Check if a file was actually downloaded
-            # info["_filename"] is set for single video/image, or check for entries in playlist
-            output_files = []
-            if info.get("_filename"):
-                output_files.append(info["_filename"])
-            elif "entries" in info:
-                for entry in info["entries"] or []:
-                    if entry and entry.get("_filename"):
-                        output_files.append(entry["_filename"])
-            # Only return True if at least one file exists
-            for f in output_files:
-                if f and Path(f).exists():
-                    return True
-            return False
-    except Exception as e:
-        print(f"yt-dlp failed: {e}")
-        return False
+def handle_direct_image(post: Dict[str, Any], outdir: Path) -> Dict[str, Any]:
+    print("Branch: DIRECT_IMAGE")
+    u = sanitize_url(post.get("url_overridden_by_dest") or post.get("url"))
+    if u:
+        download_file(u, outdir / post.get("id", "post"))
+    return {"type": "image", "url": u}
 
 
-def main():
-    if len(sys.argv) > 1:
-        url_or_id = sys.argv[1]
+def handle_preview_image(post: Dict[str, Any], outdir: Path) -> Dict[str, Any]:
+    print("Branch: PREVIEW_IMAGE (fallback)")
+    preview = post.get("preview") or {}
+    images = preview.get("images") or []
+    url = None
+    if images:
+        url = sanitize_url((images[0].get("source") or {}).get("url"))
+        if url:
+            download_file(url, outdir / post.get("id", "post"))
+    return {"type": "image_preview", "url": url}
+
+
+def handle_external(post: Dict[str, Any], outdir: Path) -> Dict[str, Any]:
+    print("Branch: EXTERNAL")
+    target = extract_external_media_url(post) or sanitize_url(
+        post.get("url_overridden_by_dest") or post.get("url")
+    )
+    info = {"type": "external", "url": target}
+    if target:
+        print(f"yt-dlp target: {target}")
+        if yt_dlp_download(target, outdir):
+            info["downloaded_via"] = "yt-dlp"
+        else:
+            info["downloaded_via"] = None
     else:
-        url_or_id = input("Paste Reddit post URL or ID: ").strip()
+        print("No external target URL found for yt-dlp.")
+        info["downloaded_via"] = None
+    return info
 
 
+# ------------------------------ Main ---------------------------------------- #
+
+def main() -> None:
+    url_or_id = sys.argv[1] if len(sys.argv) > 1 else input("Paste Reddit post URL or ID: ").strip()
     outdir = get_download_dir()
-    print(f"Output directory: {outdir}")
+    print(f"Output dir: {outdir}")
 
-    # Use utils to extract and validate post ID
-    post_id, maybe_url = parse_post_id(url_or_id)
-    if not is_valid_post_id(post_id):
-        print("Could not extract valid post ID for Reddit API. Trying yt-dlp as fallback...")
-        ok = ytdlp_download(url_or_id, outdir)
-        if ok:
-            print("Done.")
-        else:
-            print("No media downloaded. The post might have unsupported media or requires cookies.")
-        return
+    post_id, _maybe_url = parse_post_id(url_or_id)
     token = get_token()
+
     try:
-        post = get_post_json(post_id, token)
+        post_raw = fetch_post(post_id, token) if is_valid_post_id(post_id) else {}
     except requests.HTTPError as e:
-        print(f"Reddit API fetch failed: {e}. Trying yt-dlp as fallback...")
-        ok = ytdlp_download(url_or_id, outdir)
-        if ok:
-            print("Done.")
-        else:
-            print("No media downloaded. The post might have unsupported media or requires cookies.")
+        print(f"Reddit API fetch failed: {e}")
         return
 
-    # Handle gallery
-    if is_gallery(post):
-        print("Detected gallery. Downloading via Reddit API.")
-        download_gallery(post, outdir)
-        print("Done.")
+    if not post_raw:
+        print("No post data fetched.")
         return
 
-    # Handle single-image posts
-    post_hint = post.get("post_hint")
-    url = post.get("url")
-    if post_hint == "image" and url:
-        print("Detected single image post. Downloading via Reddit API.")
-        base = post.get("id", "post")
-        download_file(url, outdir / f"{base}")
-        print("Done.")
-        return
+    post = canonical_post(post_raw)
+    save_json(post, outdir, f"{post_id}_raw")
 
-    # Handle Reddit-hosted video posts
-    if post_hint == "hosted:video" and "media" in post and "reddit_video" in post["media"]:
-        video_url = post["media"]["reddit_video"].get("fallback_url")
-        if video_url:
-            print("Detected Reddit-hosted video post. Downloading via Reddit API.")
-            base = post.get("id", "post")
-            download_file(video_url, outdir / f"{base}")
-            print("Done.")
-            return
+    kind = detect_media_type(post)
 
-    # If not handled, try yt-dlp as fallback
-    print("Post type not handled by API. Trying yt-dlp as fallback...")
-    ok = ytdlp_download(url_or_id, outdir)
-    if ok:
-        print("Done.")
+    if kind == "video":
+        info = handle_video(post, outdir)
+    elif kind == "gallery":
+        info = handle_gallery(post, outdir)
+    elif kind == "direct_image":
+        info = handle_direct_image(post, outdir)
+    elif kind == "preview_image":
+        info = handle_preview_image(post, outdir)
+    elif kind == "external":
+        info = handle_external(post, outdir)
     else:
-        print("No media downloaded. The post might have unsupported media or requires cookies.")
+        print("Branch: UNKNOWN")
+        info = {"type": "unknown"}
+
+    decision = {
+        "ok": True,
+        "post_id": post.get("id"),
+        "title": post.get("title"),
+        "subreddit": post.get("subreddit"),
+        "media": info,
+        "detected_kind": kind,
+    }
+    path = save_json(decision, outdir, f"{post_id}_media")
+    print(f"Saved media info JSON to {path}")
 
 
 if __name__ == "__main__":
