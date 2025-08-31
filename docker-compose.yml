@@ -1,0 +1,13 @@
+version: "3.9"
+services:
+  grabber:
+    # You can either build locally or reference an image: tag
+    build: .
+    image: media-grabber:latest
+    env_file:
+      - .env
+    volumes:
+      - ./downloads:/downloads
+    # Example command to pass a URL directly (override at runtime as needed)
+    # command: ["https://www.reddit.com/r/gifs/comments/abc123/example/"]
+    # For interactive mode, omit command and run `docker compose run grabber`.
