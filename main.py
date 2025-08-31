@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import re
 import sys
 from pathlib import Path
@@ -39,30 +38,7 @@ EXTERNAL_EXCLUDE_DOMAINS = {
 }
 
 
-# ------------------------------ Utility ------------------------------------- #
-
-def save_json(obj: Dict[str, Any], outdir: Path, name: str) -> Path:
-    outdir.mkdir(parents=True, exist_ok=True)
-    outpath = outdir / f"{name}.json"
-    with open(outpath, "w", encoding="utf-8") as f:
-        json.dump(obj, f, indent=2, ensure_ascii=False)
-    return outpath
-
-
-def is_imageish_url(u: Optional[str]) -> bool:
-    if not u:
-        return False
-    p = urlparse(u)
-    if any(p.path.lower().endswith(ext) for ext in IMAGE_EXTS):
-        return True
-    return any(p.netloc.lower().endswith(h) for h in IMAGE_HOSTS)
-
-
-def is_external_domain(host: str) -> bool:
-    return not any(host.endswith(d) for d in EXTERNAL_EXCLUDE_DOMAINS)
-
-
-# ------------------------------ Reddit API ---------------------------------- #
+# ---------------- API ---------------- #
 
 def get_token() -> Optional[str]:
     """Return OAuth token if credentials provided, else None."""
@@ -76,13 +52,14 @@ def get_token() -> Optional[str]:
     auth = requests.auth.HTTPBasicAuth(cid, csec)
     data = {"grant_type": "password", "username": user, "password": pwd}
     headers = {"User-Agent": USER_AGENT}
-    r = requests.post(f"{API_BASE}/api/v1/access_token", auth=auth, data=data, headers=headers, timeout=20)
+    r = requests.post(
+        f"{API_BASE}/api/v1/access_token", auth=auth, data=data, headers=headers, timeout=20
+    )
     r.raise_for_status()
     return r.json().get("access_token")
 
 
 def fetch_post(post_id: str, token: Optional[str]) -> Dict[str, Any]:
-    """Fetch a single post object from Reddit. Works with or without OAuth token."""
     headers = {"User-Agent": USER_AGENT}
     cookies = {"over18": "1"}
     if token:
@@ -100,18 +77,29 @@ def fetch_post(post_id: str, token: Optional[str]) -> Dict[str, Any]:
 
 
 def canonical_post(post: Dict[str, Any]) -> Dict[str, Any]:
-    """For crossposts, prefer the original parent's object for accurate media fields."""
     cpl = post.get("crosspost_parent_list")
     if isinstance(cpl, list) and cpl:
         return cpl[0]
     return post
 
 
-# ------------------------------ Detection ----------------------------------- #
+# ---------------- Detect ---------------- #
+
+def is_imageish_url(u: Optional[str]) -> bool:
+    if not u:
+        return False
+    p = urlparse(u)
+    if any(p.path.lower().endswith(ext) for ext in IMAGE_EXTS):
+        return True
+    return any(p.netloc.lower().endswith(h) for h in IMAGE_HOSTS)
+
+
+def is_external_domain(host: str) -> bool:
+    return not any(host.endswith(d) for d in EXTERNAL_EXCLUDE_DOMAINS)
+
 
 def detect_media_type(post: Dict[str, Any]) -> str:
-    """Return one of: 'video', 'gallery', 'direct_image', 'preview_image', 'external', 'unknown'."""
-    # Video has highest priority
+    """Return one of: video | gallery | direct_image | preview_image | external | unknown."""
     if (
         post.get("is_video")
         or post.get("post_hint") == "hosted:video"
@@ -121,24 +109,19 @@ def detect_media_type(post: Dict[str, Any]) -> str:
     ):
         return "video"
 
-    # Gallery
     if "gallery_data" in post and "media_metadata" in post:
         return "gallery"
 
-    # rich embed (YouTube, TikTok, etc.) -> treat as external for yt-dlp
     if post.get("post_hint") == "rich:video":
         return "external"
 
-    # Direct image-ish link (i.redd.it / preview.redd.it / imgur direct)
     uod = sanitize_url(post.get("url_overridden_by_dest"))
     if is_imageish_url(uod):
         return "direct_image"
 
-    # Preview image (present on many posts incl. video; use only as fallback)
     if (post.get("preview") or {}).get("images"):
         return "preview_image"
 
-    # External link fallback
     if uod:
         return "external"
 
@@ -146,15 +129,13 @@ def detect_media_type(post: Dict[str, Any]) -> str:
 
 
 def extract_external_media_url(post: Dict[str, Any]) -> Optional[str]:
-    """Return best external URL to give yt-dlp, or None."""
-    # 1) Prefer explicit link if it's external and not a direct image
+    """Pick best external URL for yt-dlp."""
     u = sanitize_url(post.get("url_overridden_by_dest") or post.get("url"))
     if u:
         host = urlparse(u).netloc.lower()
         if is_external_domain(host) and not is_imageish_url(u):
             return u
 
-    # 2) Try media/secure_media oembed url or iframe src
     for key in ("media", "secure_media"):
         m = post.get(key) or {}
         oe = m.get("oembed")
@@ -162,13 +143,13 @@ def extract_external_media_url(post: Dict[str, Any]) -> Optional[str]:
             if oe.get("url"):
                 return sanitize_url(oe["url"])
             if oe.get("html"):
-                msrc = re.search(r'src="([^"]+)"', oe["html"])  # basic iframe src extractor
+                msrc = re.search(r'src="([^"]+)"', oe["html"])
                 if msrc:
                     return sanitize_url(msrc.group(1))
     return None
 
 
-# ------------------------------ Download core -------------------------------- #
+# ---------------- Download ---------------- #
 
 def download_file(url: str, outpath_stem: Path) -> None:
     outpath_stem.parent.mkdir(parents=True, exist_ok=True)
@@ -183,10 +164,10 @@ def download_file(url: str, outpath_stem: Path) -> None:
             for chunk in r.iter_content(chunk_size=1 << 15):
                 if chunk:
                     f.write(chunk)
-        print(f"Saved {outpath} (Content-Type: {ct})")
+    print(f"Saved {outpath} (Content-Type: {ct})")
 
 
-# ------------------------------ Handlers ------------------------------------ #
+# ---------------- Handlers ---------------- #
 
 def handle_video(post: Dict[str, Any], outdir: Path) -> Dict[str, Any]:
     rv = (post.get("media") or {}).get("reddit_video") or (post.get("secure_media") or {}).get("reddit_video") or {}
@@ -225,7 +206,6 @@ def handle_gallery(post: Dict[str, Any], outdir: Path) -> Dict[str, Any]:
                 download_file(url, outdir / base_name)
 
         elif kind == "AnimatedImage":
-            # Prefer native GIF if present; otherwise grab the MP4 (no conversion)
             gif = sanitize_url(s.get("gif"))
             mp4 = sanitize_url(s.get("mp4"))
             if gif:
@@ -276,14 +256,14 @@ def handle_external(post: Dict[str, Any], outdir: Path) -> Dict[str, Any]:
     return info
 
 
-# ------------------------------ Main ---------------------------------------- #
+# ---------------- Main ---------------- #
 
 def main() -> None:
     url_or_id = sys.argv[1] if len(sys.argv) > 1 else input("Paste Reddit post URL or ID: ").strip()
     outdir = get_download_dir()
     print(f"Output dir: {outdir}")
 
-    post_id, _maybe_url = parse_post_id(url_or_id)
+    post_id, _ = parse_post_id(url_or_id)
     token = get_token()
 
     try:
@@ -297,35 +277,22 @@ def main() -> None:
         return
 
     post = canonical_post(post_raw)
-    save_json(post, outdir, f"{post_id}_raw")
-
     kind = detect_media_type(post)
 
     if kind == "video":
-        info = handle_video(post, outdir)
+        handle_video(post, outdir)
     elif kind == "gallery":
-        info = handle_gallery(post, outdir)
+        handle_gallery(post, outdir)
     elif kind == "direct_image":
-        info = handle_direct_image(post, outdir)
+        handle_direct_image(post, outdir)
     elif kind == "preview_image":
-        info = handle_preview_image(post, outdir)
+        handle_preview_image(post, outdir)
     elif kind == "external":
-        info = handle_external(post, outdir)
+        handle_external(post, outdir)
     else:
         print("Branch: UNKNOWN")
-        info = {"type": "unknown"}
-
-    decision = {
-        "ok": True,
-        "post_id": post.get("id"),
-        "title": post.get("title"),
-        "subreddit": post.get("subreddit"),
-        "media": info,
-        "detected_kind": kind,
-    }
-    path = save_json(decision, outdir, f"{post_id}_media")
-    print(f"Saved media info JSON to {path}")
 
 
 if __name__ == "__main__":
     main()
+    

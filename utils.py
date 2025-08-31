@@ -6,10 +6,8 @@ from pathlib import Path
 from typing import Optional, Tuple
 from urllib.parse import urlparse
 
-# Basic UA
-USER_AGENT = "RedditMediaGrabber/1.1 (by u/yourusername)"
+USER_AGENT = "RedditMediaGrabber/1.1"
 
-# Content-Type -> extension map
 EXT_MAP = {
     "video/mp4": ".mp4",
     "image/gif": ".gif",
@@ -36,7 +34,6 @@ def get_download_dir() -> Path:
     return p
 
 
-# --- ID parsing ---
 ID_PATTERNS = [
     re.compile(r"https?://(?:www\.)?redd\.it/([a-z0-9]{5,8})", re.I),
     re.compile(r"https?://(?:www\.)?reddit\.com/r/[^/]+/comments/([a-z0-9]{5,8})", re.I),
@@ -67,7 +64,6 @@ def sanitize_url(u: str | None) -> str | None:
 def _ext_from_content_disposition(dispo: Optional[str]) -> Optional[str]:
     if not dispo:
         return None
-    # crude filename= extractor
     m = re.search(r"filename\*=UTF-8''([^;\r\n]+)|filename=\"?([^;\r\n\"]+)\"?", dispo, re.I)
     filename = m.group(1) if m and m.group(1) else (m.group(2) if m else None)
     if not filename:
@@ -80,34 +76,28 @@ def _ext_from_content_disposition(dispo: Optional[str]) -> Optional[str]:
 
 
 def sniff_ext_from_headers(content_type: Optional[str], url: str, content_disposition: Optional[str] = None) -> str:
-    # 1) Try Content-Disposition filename
     if ext := _ext_from_content_disposition(content_disposition):
         return ext
 
-    # 2) Try Content-Type map
     if content_type:
         ct = content_type.split(";", 1)[0].lower().strip()
         if ct in EXT_MAP:
             return EXT_MAP[ct]
 
-    # 3) Heuristic by host if octet-stream or unknown
     host = urlparse(url).netloc.lower()
     if host.endswith("v.redd.it"):
         return ".mp4"
     if host.endswith(IMAGE_HOSTS):
         return ".jpg"
 
-    # 4) Fallback by URL path
     path = urlparse(url).path.lower()
     for ext in (".mp4", ".gif", ".jpg", ".jpeg", ".png", ".webp"):
         if path.endswith(ext):
             return ".jpg" if ext == ".jpeg" else ext
 
-    # 5) Last resort
     return ".bin"
 
 
-# Optional yt-dlp fallback
 try:
     from yt_dlp import YoutubeDL  # type: ignore
 except Exception:
