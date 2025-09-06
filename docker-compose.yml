@@ -1,6 +1,10 @@
+version: "3.9"
 services:
-  grabber:
+  reddit-media-grabber:
+    build: .
+    image: reddit-media-grabber:latest
+    env_file: .env
     volumes:
+      - ./downloads:/downloads
       - ./main.py:/app/main.py
       - ./utils.py:/app/utils.py
-      - ./downloads:/downloads
