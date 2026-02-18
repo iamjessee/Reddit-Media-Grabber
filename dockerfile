@@ -13,8 +13,9 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-# Install Python deps)
-RUN pip install --no-cache-dir requests python-dotenv yt-dlp
+# Install Python deps
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
 
 # Copy app code + entrypoint
 COPY main.py utils.py /app/

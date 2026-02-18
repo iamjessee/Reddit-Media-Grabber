@@ -38,6 +38,20 @@ EXTERNAL_EXCLUDE_DOMAINS = {
 }
 
 
+# ---------------- Input ---------------- #
+
+def get_target() -> str:
+    """Return Reddit URL/ID from CLI arg or env var; fail if missing."""
+    if len(sys.argv) > 1 and sys.argv[1].strip():
+        return sys.argv[1].strip()
+
+    env_url = getenv_required("REDDIT_POST_URL")
+    if env_url:
+        return env_url
+
+    raise SystemExit("Missing target URL/ID. Pass arg or set REDDIT_POST_URL.")
+
+
 # ---------------- API ---------------- #
 
 def get_token() -> Optional[str]:
@@ -259,7 +273,7 @@ def handle_external(post: Dict[str, Any], outdir: Path) -> Dict[str, Any]:
 # ---------------- Main ---------------- #
 
 def main() -> None:
-    url_or_id = sys.argv[1] if len(sys.argv) > 1 else input("Paste Reddit post URL or ID: ").strip()
+    url_or_id = get_target()
     outdir = get_download_dir()
     print(f"Output dir: {outdir}")
 
