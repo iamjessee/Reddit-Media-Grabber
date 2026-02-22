@@ -18,6 +18,7 @@ from utils import (
     sanitize_url,
     sniff_ext_from_headers,
     yt_dlp_download,
+    upload_directory_to_blob,
 )
 
 load_dotenv()
@@ -305,6 +306,15 @@ def main() -> None:
         handle_external(post, outdir)
     else:
         print("Branch: UNKNOWN")
+        return
+
+    # After download completes
+    uploaded = upload_directory_to_blob(outdir)
+
+    if uploaded:
+        print("Uploaded blobs:")
+        for url in uploaded:
+            print(url)
 
 
 if __name__ == "__main__":

@@ -121,3 +121,50 @@ def yt_dlp_download(url: str, outdir: Path) -> bool:
             return bool(info)
     except Exception:
         return False
+
+# ---------------- Azure Blob Upload ---------------- #
+
+from typing import List
+from azure.core.exceptions import ResourceExistsError
+
+def upload_directory_to_blob(outdir: Path) -> List[str]:
+    """
+    Upload all files in outdir to Azure Blob Storage.
+    Returns list of blob URLs if env vars are set.
+    """
+    import os
+    from azure.storage.blob import BlobServiceClient
+
+    conn_str = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
+    container_name = os.getenv("AZURE_BLOB_CONTAINER")
+
+    if not conn_str or not container_name:
+        print("Azure storage env vars not set. Skipping upload.")
+        return []
+
+    blob_service = BlobServiceClient.from_connection_string(conn_str)
+    container_client = blob_service.get_container_client(container_name)
+
+    # Create container if it doesn't already exist
+    try:
+        container_client.create_container()
+        print(f"Created blob container: {container_name}")
+    except ResourceExistsError:
+        print(f"Blob container already exists: {container_name}")
+
+    uploaded_urls = []
+
+    for file in outdir.glob("*"):
+        if not file.is_file():
+            continue
+
+        blob_name = file.name
+
+        with open(file, "rb") as data:
+            container_client.upload_blob(name=blob_name, data=data, overwrite=True)
+
+        blob_url = f"{container_client.url}/{blob_name}"
+        uploaded_urls.append(blob_url)
+        print(f"Uploaded to Blob: {blob_url}")
+
+    return uploaded_urls
